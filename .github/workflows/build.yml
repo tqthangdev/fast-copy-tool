@@ -131,6 +131,8 @@ jobs:
           chmod +x linuxdeploy.AppImage
 
       - name: Build AppImage
+        env:
+          LDAI_OUTPUT: FastCopyTool-Linux.AppImage
         run: |
           ./linuxdeploy.AppImage \
             --appdir AppDir \
@@ -138,14 +140,15 @@ jobs:
             --icon-file AppDir/usr/share/icons/hicolor/scalable/apps/FastCopyTool.svg \
             --output appimage
 
-      - name: Rename AppImage
+      - name: Verify AppImage
         run: |
-          mv FastCopyTool*.AppImage FastCopyTool-Linux.AppImage
+          test -f FastCopyTool-Linux.AppImage
+          ls -lh FastCopyTool-Linux.AppImage
 
       - name: Make AppImage executable
         run: chmod +x FastCopyTool-Linux.AppImage
 
-      - name: Upload Linux build
+      - name: Upload Linux AppImage
         uses: actions/upload-artifact@v4
         with:
           name: linux-appimage
@@ -174,6 +177,10 @@ jobs:
         with:
           name: linux-appimage
           path: release
+
+      - name: Show release files
+        run: |
+          ls -lh release
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
