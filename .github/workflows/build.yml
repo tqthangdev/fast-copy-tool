@@ -118,6 +118,9 @@ jobs:
           cp dist/FastCopyTool \
              AppDir/usr/bin/FastCopyTool
 
+          cp assets/icon.png AppDir/.DirIcon
+          cp assets/icon.png AppDir/FastCopyTool.png
+
           cp assets/icon.png \
              AppDir/usr/share/icons/hicolor/256x256/apps/FastCopyTool.png
 
