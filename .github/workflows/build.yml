@@ -32,8 +32,28 @@ jobs:
           pip install -r requirements.txt
           pip install pyinstaller
 
+      - name: Verify assets
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "assets\icon.png")) {
+            Write-Error "Missing assets\icon.png"
+          }
+
+          if (-not (Test-Path "assets\icon.ico")) {
+            Write-Error "Missing assets\icon.ico"
+          }
+
       - name: Build executable
-        run: pyinstaller --noconfirm --clean --onefile --windowed --name FastCopyTool main.py
+        run: >
+          pyinstaller
+          --noconfirm
+          --clean
+          --onefile
+          --windowed
+          --name FastCopyTool
+          --icon assets/icon.ico
+          --add-data "assets;assets"
+          main.py
 
       - name: Rename executable
         run: Rename-Item dist\FastCopyTool.exe FastCopyTool-Windows.exe
@@ -74,6 +94,11 @@ jobs:
           pip install -r requirements.txt
           pip install pyinstaller
 
+      - name: Verify assets
+        run: |
+          test -f assets/icon.png
+          test -f assets/icon.ico
+
       - name: Build PyInstaller binary
         run: |
           pyinstaller \
@@ -81,15 +106,20 @@ jobs:
             --clean \
             --onefile \
             --name FastCopyTool \
+            --add-data "assets:assets" \
             main.py
 
       - name: Create AppDir
         run: |
           mkdir -p AppDir/usr/bin
           mkdir -p AppDir/usr/share/applications
-          mkdir -p AppDir/usr/share/icons/hicolor/scalable/apps
+          mkdir -p AppDir/usr/share/icons/hicolor/256x256/apps
 
-          cp dist/FastCopyTool AppDir/usr/bin/FastCopyTool
+          cp dist/FastCopyTool \
+             AppDir/usr/bin/FastCopyTool
+
+          cp assets/icon.png \
+             AppDir/usr/share/icons/hicolor/256x256/apps/FastCopyTool.png
 
           cat > AppDir/usr/share/applications/FastCopyTool.desktop << 'EOF'
           [Desktop Entry]
@@ -100,24 +130,6 @@ jobs:
           Terminal=false
           Type=Application
           Categories=Utility;FileTools;
-          EOF
-
-          cat > AppDir/usr/share/icons/hicolor/scalable/apps/FastCopyTool.svg << 'EOF'
-          <svg xmlns="http://www.w3.org/2000/svg"
-               width="128"
-               height="128"
-               viewBox="0 0 128 128">
-            <rect x="8" y="8" width="112" height="112" rx="20"
-                  fill="#4c6fff"/>
-            <path d="M35 39h58v14H35zM35 61h58v14H35zM35 83h38v6H35z"
-                  fill="white"/>
-            <path d="M84 80l12 12-12 12"
-                  fill="none"
-                  stroke="white"
-                  stroke-width="7"
-                  stroke-linecap="round"
-                  stroke-linejoin="round"/>
-          </svg>
           EOF
 
           chmod +x AppDir/usr/bin/FastCopyTool
@@ -137,7 +149,7 @@ jobs:
           ./linuxdeploy.AppImage \
             --appdir AppDir \
             --desktop-file AppDir/usr/share/applications/FastCopyTool.desktop \
-            --icon-file AppDir/usr/share/icons/hicolor/scalable/apps/FastCopyTool.svg \
+            --icon-file AppDir/usr/share/icons/hicolor/256x256/apps/FastCopyTool.png \
             --output appimage
 
       - name: Verify AppImage

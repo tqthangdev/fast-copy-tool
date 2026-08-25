@@ -6,8 +6,10 @@ import platform
 import subprocess
 import threading
 import time
+from pathlib import Path
 
 from PySide6.QtCore import QThread, Signal
+from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import (
     QApplication,
     QWidget,
@@ -22,6 +24,18 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QGridLayout,
 )
+
+
+def resource_path(path):
+    base = Path(
+        getattr(
+            sys,
+            "_MEIPASS",
+            Path(__file__).resolve().parent,
+        )
+    )
+
+    return str(base / path)
 
 try:
     import psutil
@@ -859,6 +873,10 @@ class MainWindow(QWidget):
         super().__init__()
 
         self.setWindowTitle("Fast Copy Tool")
+
+        self.setWindowIcon(
+            QIcon(resource_path("assets/icon.png"))
+        )
 
         self.setFixedSize(
             600,
