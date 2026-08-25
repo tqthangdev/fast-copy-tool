@@ -6,6 +6,9 @@ on:
     tags:
       - "v*"
 
+permissions:
+  contents: write
+
 jobs:
   build-windows:
     name: Build Windows
@@ -29,11 +32,14 @@ jobs:
       - name: Build executable
         run: pyinstaller --noconfirm --clean --onefile --windowed --name FastCopyTool main.py
 
+      - name: Rename executable
+        run: Rename-Item dist\FastCopyTool.exe FastCopyTool-Windows.exe
+
       - name: Upload Windows build
         uses: actions/upload-artifact@v4
         with:
-          name: FastCopyTool-Windows
-          path: dist/FastCopyTool.exe
+          name: windows-build
+          path: dist/FastCopyTool-Windows.exe
 
   build-linux:
     name: Build Linux
@@ -70,11 +76,42 @@ jobs:
             --name FastCopyTool \
             main.py
 
+      - name: Rename executable
+        run: mv dist/FastCopyTool dist/FastCopyTool-Linux
+
       - name: Make executable
-        run: chmod +x dist/FastCopyTool
+        run: chmod +x dist/FastCopyTool-Linux
 
       - name: Upload Linux build
         uses: actions/upload-artifact@v4
         with:
-          name: FastCopyTool-Linux
-          path: dist/FastCopyTool
+          name: linux-build
+          path: dist/FastCopyTool-Linux
+
+  release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    needs:
+      - build-windows
+      - build-linux
+
+    steps:
+      - name: Download Windows build
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-build
+          path: release
+
+      - name: Download Linux build
+        uses: actions/download-artifact@v4
+        with:
+          name: linux-build
+          path: release
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release/FastCopyTool-Windows.exe
+            release/FastCopyTool-Linux
+          generate_release_notes: true
