@@ -10,6 +10,9 @@ permissions:
   contents: write
 
 jobs:
+  # ------------------------------------------------------------------------- #
+  # Build Windows
+  # ------------------------------------------------------------------------- #
   build-windows:
     name: Build Windows
     runs-on: windows-latest
@@ -41,8 +44,11 @@ jobs:
           name: windows-build
           path: dist/FastCopyTool-Windows.exe
 
+  # ------------------------------------------------------------------------- #
+  # Build Linux AppImage
+  # ------------------------------------------------------------------------- #
   build-linux:
-    name: Build Linux
+    name: Build Linux AppImage
     runs-on: ubuntu-latest
 
     steps:
@@ -59,7 +65,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             libxcb-cursor0 \
-            libxkbcommon-x11-0
+            libxkbcommon-x11-0 \
+            wget
 
       - name: Install Python dependencies
         run: |
@@ -67,7 +74,7 @@ jobs:
           pip install -r requirements.txt
           pip install pyinstaller
 
-      - name: Build executable
+      - name: Build PyInstaller binary
         run: |
           pyinstaller \
             --noconfirm \
@@ -76,21 +83,81 @@ jobs:
             --name FastCopyTool \
             main.py
 
-      - name: Rename executable
-        run: mv dist/FastCopyTool dist/FastCopyTool-Linux
+      - name: Create AppDir
+        run: |
+          mkdir -p AppDir/usr/bin
+          mkdir -p AppDir/usr/share/applications
+          mkdir -p AppDir/usr/share/icons/hicolor/scalable/apps
 
-      - name: Make executable
-        run: chmod +x dist/FastCopyTool-Linux
+          cp dist/FastCopyTool AppDir/usr/bin/FastCopyTool
+
+          cat > AppDir/usr/share/applications/FastCopyTool.desktop << 'EOF'
+          [Desktop Entry]
+          Name=Fast Copy Tool
+          Comment=Fast cross-platform file copy and move tool
+          Exec=FastCopyTool
+          Icon=FastCopyTool
+          Terminal=false
+          Type=Application
+          Categories=Utility;FileTools;
+          EOF
+
+          cat > AppDir/usr/share/icons/hicolor/scalable/apps/FastCopyTool.svg << 'EOF'
+          <svg xmlns="http://www.w3.org/2000/svg"
+               width="128"
+               height="128"
+               viewBox="0 0 128 128">
+            <rect x="8" y="8" width="112" height="112" rx="20"
+                  fill="#4c6fff"/>
+            <path d="M35 39h58v14H35zM35 61h58v14H35zM35 83h38v6H35z"
+                  fill="white"/>
+            <path d="M84 80l12 12-12 12"
+                  fill="none"
+                  stroke="white"
+                  stroke-width="7"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"/>
+          </svg>
+          EOF
+
+          chmod +x AppDir/usr/bin/FastCopyTool
+
+      - name: Download linuxdeploy
+        run: |
+          wget -q \
+            https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage \
+            -O linuxdeploy.AppImage
+
+          chmod +x linuxdeploy.AppImage
+
+      - name: Build AppImage
+        run: |
+          ./linuxdeploy.AppImage \
+            --appdir AppDir \
+            --desktop-file AppDir/usr/share/applications/FastCopyTool.desktop \
+            --icon-file AppDir/usr/share/icons/hicolor/scalable/apps/FastCopyTool.svg \
+            --output appimage
+
+      - name: Rename AppImage
+        run: |
+          mv FastCopyTool*.AppImage FastCopyTool-Linux.AppImage
+
+      - name: Make AppImage executable
+        run: chmod +x FastCopyTool-Linux.AppImage
 
       - name: Upload Linux build
         uses: actions/upload-artifact@v4
         with:
-          name: linux-build
-          path: dist/FastCopyTool-Linux
+          name: linux-appimage
+          path: FastCopyTool-Linux.AppImage
 
+  # ------------------------------------------------------------------------- #
+  # Create GitHub Release
+  # ------------------------------------------------------------------------- #
   release:
     name: Create GitHub Release
     runs-on: ubuntu-latest
+
     needs:
       - build-windows
       - build-linux
@@ -102,10 +169,10 @@ jobs:
           name: windows-build
           path: release
 
-      - name: Download Linux build
+      - name: Download Linux AppImage
         uses: actions/download-artifact@v4
         with:
-          name: linux-build
+          name: linux-appimage
           path: release
 
       - name: Create GitHub Release
@@ -113,5 +180,5 @@ jobs:
         with:
           files: |
             release/FastCopyTool-Windows.exe
-            release/FastCopyTool-Linux
+            release/FastCopyTool-Linux.AppImage
           generate_release_notes: true
