@@ -43,32 +43,43 @@ jobs:
             Write-Error "Missing assets\icon.ico"
           }
 
-      - name: Build executable
+      - name: Build Windows
         run: >
           pyinstaller
           --noconfirm
           --clean
-          --onefile
           --windowed
           --name FastCopyTool
           --icon assets/icon.ico
           --add-data "assets;assets"
           main.py
 
-      - name: Rename executable
-        run: Rename-Item dist\FastCopyTool.exe FastCopyTool-Windows.exe
+      - name: Verify build
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "dist\FastCopyTool\FastCopyTool.exe")) {
+            Write-Error "Build failed: FastCopyTool.exe not found"
+          }
+
+          Get-ChildItem -Recurse dist\FastCopyTool
+
+      - name: Package Windows
+        run: |
+          Compress-Archive `
+            -Path dist\FastCopyTool `
+            -DestinationPath FastCopyTool-Windows.zip
 
       - name: Upload Windows build
         uses: actions/upload-artifact@v4
         with:
           name: windows-build
-          path: dist/FastCopyTool-Windows.exe
+          path: FastCopyTool-Windows.zip
 
   # ------------------------------------------------------------------------- #
-  # Build Linux AppImage
+  # Build Linux
   # ------------------------------------------------------------------------- #
   build-linux:
-    name: Build Linux AppImage
+    name: Build Linux
     runs-on: ubuntu-latest
 
     steps:
@@ -85,8 +96,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             libxcb-cursor0 \
-            libxkbcommon-x11-0 \
-            wget
+            libxkbcommon-x11-0
 
       - name: Install Python dependencies
         run: |
@@ -99,75 +109,32 @@ jobs:
           test -f assets/icon.png
           test -f assets/icon.ico
 
-      - name: Build PyInstaller binary
+      - name: Build Linux
         run: |
           pyinstaller \
             --noconfirm \
             --clean \
-            --onefile \
             --name FastCopyTool \
             --add-data "assets:assets" \
             main.py
 
-      - name: Create AppDir
+      - name: Verify build
         run: |
-          mkdir -p AppDir/usr/bin
-          mkdir -p AppDir/usr/share/applications
-          mkdir -p AppDir/usr/share/icons/hicolor/256x256/apps
+          test -f dist/FastCopyTool/FastCopyTool
+          find dist/FastCopyTool -maxdepth 2 -type f -print
 
-          cp dist/FastCopyTool \
-             AppDir/usr/bin/FastCopyTool
+      - name: Make executable
+        run: chmod +x dist/FastCopyTool/FastCopyTool
 
-          cp assets/icon.png AppDir/.DirIcon
-          cp assets/icon.png AppDir/FastCopyTool.png
-
-          cp assets/icon.png \
-             AppDir/usr/share/icons/hicolor/256x256/apps/FastCopyTool.png
-
-          cat > AppDir/usr/share/applications/FastCopyTool.desktop << 'EOF'
-          [Desktop Entry]
-          Name=Fast Copy Tool
-          Comment=Fast cross-platform file copy and move tool
-          Exec=FastCopyTool
-          Icon=FastCopyTool
-          Terminal=false
-          Type=Application
-          Categories=Utility;FileTools;
-          EOF
-
-          chmod +x AppDir/usr/bin/FastCopyTool
-
-      - name: Download linuxdeploy
+      - name: Package Linux
         run: |
-          wget -q \
-            https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage \
-            -O linuxdeploy.AppImage
+          zip -r FastCopyTool-Linux.zip dist/FastCopyTool
 
-          chmod +x linuxdeploy.AppImage
-
-      - name: Build AppImage
-        env:
-          LDAI_OUTPUT: FastCopyTool-Linux.AppImage
-        run: |
-          ./linuxdeploy.AppImage \
-            --appdir AppDir \
-            --desktop-file AppDir/usr/share/applications/FastCopyTool.desktop \
-            --icon-file AppDir/usr/share/icons/hicolor/256x256/apps/FastCopyTool.png \
-            --output appimage
-
-      - name: Verify AppImage
-        run: |
-          test -f FastCopyTool-Linux.AppImage
-          ls -lh FastCopyTool-Linux.AppImage
-
-      - name: Make AppImage executable
-        run: chmod +x FastCopyTool-Linux.AppImage
-
-      - name: Upload Linux AppImage
+      - name: Upload Linux build
         uses: actions/upload-artifact@v4
         with:
-          name: linux-appimage
-          path: FastCopyTool-Linux.AppImage
+          name: linux-build
+          path: FastCopyTool-Linux.zip
 
   # ------------------------------------------------------------------------- #
   # Create GitHub Release
@@ -180,6 +147,9 @@ jobs:
       - build-windows
       - build-linux
 
+    # Only create a release when a v* tag is pushed.
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+
     steps:
       - name: Download Windows build
         uses: actions/download-artifact@v4
@@ -187,10 +157,10 @@ jobs:
           name: windows-build
           path: release
 
-      - name: Download Linux AppImage
+      - name: Download Linux build
         uses: actions/download-artifact@v4
         with:
-          name: linux-appimage
+          name: linux-build
           path: release
 
       - name: Show release files
@@ -201,6 +171,6 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            release/FastCopyTool-Windows.exe
-            release/FastCopyTool-Linux.AppImage
+            release/FastCopyTool-Windows.zip
+            release/FastCopyTool-Linux.zip
           generate_release_notes: true
