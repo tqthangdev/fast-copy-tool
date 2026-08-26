@@ -5,17 +5,21 @@ command (Windows: `robocopy /MT`, Linux/macOS: `rsync`), with a modern Qt6 UI.
 
 ## Download
 
-Prebuilt executables for Windows and Linux are attached to each GitHub Release:
+Prebuilt standalone builds are published as **GitHub Releases** — no Python or package installation required on the target machine.
 
-- Windows: `FastCopyTool-Windows.exe`
-- Linux: `FastCopyTool-Linux`
+### Get the latest build
 
-Download the latest version from the
-[Releases page](https://github.com/tqthangdev/fast-copy-tool/releases).
-Releases are built automatically by GitHub Actions whenever a `v*` tag is pushed.
-If you prefer a recent build before the next release, you can also run the
-build manually from the
-[Actions tab](https://github.com/tqthangdev/fast-copy-tool/actions).
+1. Go to the [Releases](https://github.com/tqthangdev/fast-copy-tool/releases) page.
+2. Pick the newest release (tagged `v*`).
+3. Download the build for your OS:
+   * **`FastCopyTool-Windows.zip`** — Windows
+   * **`FastCopyTool-Linux.zip`** — Linux
+4. Extract the ZIP archive.
+5. Run the application:
+   * **Windows:** Run `FastCopyTool.exe`
+   * **Linux:** Run `./FastCopyTool`
+
+> **No dependencies needed:** Each build is fully self-contained and includes everything required to run the application.
 
 ## Requirements
 
