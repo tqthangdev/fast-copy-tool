@@ -87,6 +87,18 @@ def format_size(size):
 
     return f"{size / 1024 ** 4:.2f} TB"
 
+def format_duration(seconds):
+    seconds = float(seconds)
+    hours, remainder = divmod(seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+
+    if hours >= 1:
+        return f"{hours:.0f}h {minutes:.0f}m {seconds:.2f}s"
+
+    if minutes >= 1:
+        return f"{minutes:.0f}m {seconds:.2f}s"
+
+    return f"{seconds:.2f}s"
 
 # --------------------------------------------------------------------------- #
 # Copy tool
@@ -432,18 +444,25 @@ class CopyWorker(QThread):
         self.completed_files = 0
         self.total_files = 0
 
+        self.transferred_size = 0
+        self.elapsed_seconds = 0
+        self.status = "Preparing"
+
     def run(self):
+        started_at = time.monotonic()
+        self.status = "Running"
         try:
             if not self.tool.is_installed():
+                self.status = "Error"
+                self.elapsed_seconds = time.monotonic() - started_at
                 self.error.emit(
                     f"'{self.tool.name}' is not installed. "
                     "Open [About] to install it."
                 )
                 return
 
-            # Calculate the source size only once.
-            # The copy process itself does not repeatedly scan the destination.
             self.total_size = get_dir_size(self.src)
+            self.total_files = self._count_files(self.src)
 
             if IS_WINDOWS:
                 self.total_files = self._count_files(self.src)
@@ -479,6 +498,8 @@ class CopyWorker(QThread):
                 self.proc.wait()
 
             if self.cancelled:
+                self.status = "Cancelled"
+                self.elapsed_seconds = time.monotonic() - started_at
                 self.finished_ok.emit(True)
                 return
 
@@ -488,16 +509,24 @@ class CopyWorker(QThread):
                 # Robocopy exit codes 0-7 indicate success or
                 # success with differences.
                 if returncode >= 8:
+                    self.status = "Error"
+                    self.elapsed_seconds = time.monotonic() - started_at
                     self.error.emit(f"Robocopy exited with error code {returncode}.")
                     return
 
             else:
                 if returncode != 0:
+                    self.status = "Error"
+                    self.elapsed_seconds = time.monotonic() - started_at
                     self.error.emit(f"rsync exited with error code {returncode}.")
                     return
 
             if self.move and IS_LINUX:
                 self._cleanup_empty_source_dirs()
+
+            self.transferred_size = self.total_size
+            self.elapsed_seconds = time.monotonic() - started_at
+            self.status = "Success"
 
             self.progress.emit(100)
 
@@ -508,6 +537,8 @@ class CopyWorker(QThread):
             self.finished_ok.emit(False)
 
         except Exception as e:
+            self.status = "Error"
+            self.elapsed_seconds = time.monotonic() - started_at
             self.error.emit(str(e))
 
     def _run_rsync(self):
@@ -973,6 +1004,10 @@ class MainWindow(QWidget):
 
         self.file_label.setWordWrap(True)
 
+        self.file_label.setOpenExternalLinks(False)
+
+        self.file_label.linkActivated.connect(self._show_details)
+
         root.addWidget(self.file_label)
 
         root.addStretch(1)
@@ -1131,26 +1166,54 @@ class MainWindow(QWidget):
             self.file_label.setText("Cancelled.")
             return
 
-        self.file_label.setText("Completed.")
+        details = self._details_text("Success")
+
+        self.file_label.setText(
+            'Completed&nbsp;&nbsp;<a href="details">[Detail]</a>'
+        )
 
         QMessageBox.information(
             self,
             f"{operation} completed",
-            f"{operation} operation completed successfully.",
+            f"{operation} operation completed successfully.\n\n{details}",
         )
 
     def _on_error(self, message):
         operation = self.current_operation or "Operation"
 
         self._reset_buttons()
+
+        details = self._details_text("Error")
+
         self.file_label.setText(
-            f"{operation}: Failed."
+            'Failed&nbsp;&nbsp;<a href="details">[Detail]</a>'
         )
 
         QMessageBox.critical(
             self,
             f"{operation} error",
-            message,
+            f"{message}\n\n{details}",
+        )
+
+    def _details_text(self, status):
+        if not self.worker:
+            return f"Status: {status}"
+
+        return (
+            f"Status: {status}\n"
+            f"Files: {self.worker.total_files}\n"
+            f"Size: {format_size(self.worker.transferred_size)}\n"
+            f"Time: {format_duration(self.worker.elapsed_seconds)}"
+        )
+
+    def _show_details(self, _link):
+        operation = self.current_operation or "Operation"
+        status = self.worker.status if self.worker else "Unknown"
+
+        QMessageBox.information(
+            self,
+            f"{operation} details",
+            self._details_text(status),
         )
 
     def _reset_buttons(self):
