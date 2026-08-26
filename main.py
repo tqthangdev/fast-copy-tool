@@ -588,6 +588,9 @@ class CopyWorker(QThread):
 
             lower = line.lower()
 
+            # Normalize excessive whitespace in Robocopy output.
+            display_line = re.sub(r"\s+", " ", line).strip()
+
             # Skip robocopy headers and summary information.
             if lower.startswith(
                 (
@@ -627,13 +630,12 @@ class CopyWorker(QThread):
                         )
                     )
 
-                self.file_update.emit(line[:160])
-
+                self.file_update.emit(display_line[:160])
                 continue
 
             # Show individual file paths that robocopy outputs.
             if "\\" in line:
-                self.file_update.emit(line[:160])
+                self.file_update.emit(display_line[:160])
 
     def _count_files(self, path):
         """Count source files once for Windows progress reporting."""
@@ -884,6 +886,7 @@ class MainWindow(QWidget):
         )
 
         self.worker = None
+        self.current_operation = None
 
         self._build_ui()
 
@@ -1071,14 +1074,11 @@ class MainWindow(QWidget):
             QMessageBox.critical(
                 self,
                 "Error",
-                "The source and destination directories " "cannot be the same.",
+                "The source and destination directories cannot be the same.",
             )
             return
 
-        os.makedirs(
-            dst,
-            exist_ok=True,
-        )
+        os.makedirs(dst, exist_ok=True)
 
         tool = CopyTool()
 
@@ -1086,70 +1086,70 @@ class MainWindow(QWidget):
             QMessageBox.warning(
                 self,
                 "Missing Tool",
-                f"Operating system: "
-                f"{'Windows' if IS_WINDOWS else 'Linux'}\n\n"
                 f"'{tool.name}' is not installed.\n"
                 "Please open [About] and install it first.",
             )
             return
 
-        self.progress.setValue(0)
+        self.current_operation = "Move" if move else "Copy"
 
+        self.progress.setValue(0)
         self.file_label.setText("Preparing...")
 
         self.btn_copy.setEnabled(False)
         self.btn_move.setEnabled(False)
-
         self.btn_pause.setEnabled(True)
         self.btn_pause.setText("Pause")
-
         self.btn_cancel.setEnabled(True)
 
-        self.worker = CopyWorker(
-            src,
-            dst,
-            move,
-        )
+        self.worker = CopyWorker(src, dst, move)
 
         self.worker.progress.connect(self.progress.setValue)
 
         self.worker.file_update.connect(
-            lambda name: self.file_label.setText(name[:160])
+            lambda name: self.file_label.setText(name[:150])
         )
 
         self.worker.speed_update.connect(self._on_speed_update)
-
         self.worker.finished_ok.connect(self._on_done)
-
         self.worker.error.connect(self._on_error)
 
         self.worker.start()
 
     def _on_speed_update(self, speed):
         if speed:
-            self.file_label.setText(f"Transfer speed: {speed}")
+            self.file_label.setText(
+                f"Transfer speed: {speed}"
+            )
 
     def _on_done(self, cancelled):
+        operation = self.current_operation or "Operation"
+
         self._reset_buttons()
 
         if cancelled:
-            self.file_label.setText("Operation cancelled.")
+            self.file_label.setText("Cancelled.")
+            return
 
-        else:
-            self.file_label.setText("Completed.")
+        self.file_label.setText("Completed.")
 
-            QMessageBox.information(
-                self,
-                "Done",
-                "Copy/move operation completed successfully.",
-            )
+        QMessageBox.information(
+            self,
+            f"{operation} completed",
+            f"{operation} operation completed successfully.",
+        )
 
     def _on_error(self, message):
+        operation = self.current_operation or "Operation"
+
         self._reset_buttons()
+        self.file_label.setText(
+            f"{operation}: Failed."
+        )
 
         QMessageBox.critical(
             self,
-            "Error",
+            f"{operation} error",
             message,
         )
 
