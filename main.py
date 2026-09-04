@@ -37,6 +37,7 @@ def resource_path(path):
 
     return str(base / path)
 
+
 try:
     import psutil
 
@@ -73,8 +74,10 @@ def get_dir_size(path):
 
 def format_size(size):
     """Format a byte count as a human-readable size."""
+    size = float(size)
+
     if size < 1024:
-        return f"{size} B"
+        return f"{size:.0f} B"
 
     if size < 1024**2:
         return f"{size / 1024:.1f} KB"
@@ -86,6 +89,7 @@ def format_size(size):
         return f"{size / 1024 ** 3:.2f} GB"
 
     return f"{size / 1024 ** 4:.2f} TB"
+
 
 def format_duration(seconds):
     seconds = float(seconds)
@@ -99,6 +103,60 @@ def format_duration(seconds):
         return f"{minutes:.0f}m {seconds:.2f}s"
 
     return f"{seconds:.2f}s"
+
+
+def get_process_write_bytes(pid):
+    """
+    Return the total number of bytes a process (and all of its live
+    descendants) has actually caused to be written to the storage
+    layer, as reported by the kernel — the same figure exposed via
+    /proc/<pid>/io's 'write_bytes' field on Linux, or
+    GetProcessIoCounters() on Windows.
+
+    This is used instead of re-scanning the destination directory: it's
+    a single cheap counter read per process rather than an O(number of
+    files) directory walk, and it comes straight from the kernel rather
+    than from parsing a tool's stdout.
+
+    rsync (for local transfers) forks itself into a sender and a
+    generator/receiver, so the byte-writing work happens in a child
+    process, not necessarily the one we launched — hence summing over
+    descendants too. robocopy on Windows is single-process (it just
+    uses multiple threads internally), so there normally are no
+    descendants to add.
+
+    Returns None if psutil isn't available or the counters can't be
+    read (e.g. the process already exited, or the platform/kernel
+    doesn't expose them).
+    """
+
+    if not HAS_PSUTIL:
+        return None
+
+    try:
+        root_process = psutil.Process(pid)
+    except Exception:
+        return None
+
+    processes = [root_process]
+
+    try:
+        processes.extend(root_process.children(recursive=True))
+    except Exception:
+        pass
+
+    total = 0
+    got_any = False
+
+    for process in processes:
+        try:
+            total += process.io_counters().write_bytes
+            got_any = True
+        except Exception:
+            continue
+
+    return total if got_any else None
+
 
 # --------------------------------------------------------------------------- #
 # Copy tool
@@ -296,12 +354,12 @@ class CopyTool:
         if ok:
             return (
                 True,
-                f"rsync was installed successfully using " f"{package_manager}.",
+                f"rsync was installed successfully using {package_manager}.",
             )
 
         return (
             False,
-            f"Failed to install rsync using " f"{package_manager}.\n\n{message}",
+            f"Failed to install rsync using {package_manager}.\n\n{message}",
         )
 
     def update(self):
@@ -360,24 +418,17 @@ class CopyTool:
         if ok:
             return (
                 True,
-                f"rsync was updated successfully using "
-                f"{package_manager}.\n\n"
+                f"rsync was updated successfully using {package_manager}.\n\n"
                 "The package was already up to date if no changes were needed.",
             )
 
         return (
             False,
-            f"Failed to update rsync using " f"{package_manager}.\n\n{message}",
+            f"Failed to update rsync using {package_manager}.\n\n{message}",
         )
 
     def build_command(self, src, dst, move):
         if IS_WINDOWS:
-            # /E    : Copy all subdirectories, including empty ones
-            # /MT:8 : Use 8 threads for faster copying
-            # /R:2  : Retry failed copies up to 2 times
-            # /W:1  : Wait 1 second between retries
-            # /BYTES : Display file sizes in bytes
-            # /ETA   : Display estimated time of arrival
             command = [
                 "robocopy",
                 src,
@@ -395,13 +446,15 @@ class CopyTool:
 
             return command
 
-        # --info=progress2 shows overall transfer progress.
-        # This avoids repeatedly scanning the destination directory.
         command = [
             "rsync",
             "-a",
-            "--info=progress2",
-            "--human-readable",
+            # name1 prints each transferred file's relative path as it
+            # goes, which --info=progress2 alone does NOT do. Progress
+            # itself is measured separately by reading the kernel's own
+            # I/O accounting for the rsync process (see
+            # CopyWorker._io_poll_loop), not by parsing rsync's output.
+            "--info=name1",
         ]
 
         if move:
@@ -423,7 +476,7 @@ class CopyTool:
 class CopyWorker(QThread):
     progress = Signal(int)
     file_update = Signal(str)
-    speed_update = Signal(str)
+    stats_update = Signal(str, str, str)
     finished_ok = Signal(bool)
     error = Signal(str)
 
@@ -441,31 +494,63 @@ class CopyWorker(QThread):
         self.tool = CopyTool()
 
         self.total_size = 0
-        self.completed_files = 0
         self.total_files = 0
 
         self.transferred_size = 0
         self.elapsed_seconds = 0
         self.status = "Preparing"
 
+        self.last_progress = 0
+
+        self.transfer_started_at = 0
+        self.last_speed_time = 0
+        self.last_speed_bytes = 0
+        self.current_speed = 0
+
+        # Progress is driven by reading the kernel's own I/O accounting
+        # for the copy process (bytes actually written to storage), not
+        # by parsing rsync/robocopy's own self-reported counters and not
+        # by re-scanning the destination directory. See _io_poll_loop.
+        self.write_bytes_baseline = 0
+        self.io_tracking_available = HAS_PSUTIL
+        self._stop_poll = threading.Event()
+        self._io_poll_thread = None
+
     def run(self):
         started_at = time.monotonic()
+
+        self.transfer_started_at = started_at
+        self.last_speed_time = started_at
+        self.last_speed_bytes = 0
+        self.current_speed = 0
+
         self.status = "Running"
+
         try:
             if not self.tool.is_installed():
                 self.status = "Error"
                 self.elapsed_seconds = time.monotonic() - started_at
+
                 self.error.emit(
                     f"'{self.tool.name}' is not installed. "
                     "Open [About] to install it."
                 )
+
                 return
+
+            # Scan source once before starting the transfer.
+            self.file_update.emit("Scanning source...")
 
             self.total_size = get_dir_size(self.src)
             self.total_files = self._count_files(self.src)
 
-            if IS_WINDOWS:
-                self.total_files = self._count_files(self.src)
+            self.transferred_size = 0
+
+            self.last_progress = 0
+
+            self.progress.emit(0)
+
+            self._update_stats(force=True)
 
             command = self.tool.build_command(
                 self.src,
@@ -482,12 +567,16 @@ class CopyWorker(QThread):
             }
 
             if IS_WINDOWS:
-                popen_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+                popen_kwargs["creationflags"] = (
+                    subprocess.CREATE_NO_WINDOW
+                )
 
             self.proc = subprocess.Popen(
                 command,
                 **popen_kwargs,
             )
+
+            self._start_io_poller()
 
             if IS_LINUX:
                 self._run_rsync()
@@ -495,11 +584,37 @@ class CopyWorker(QThread):
                 self._run_robocopy()
 
             if self.proc.poll() is None:
+                # The line-reading loop above has exited (pipe closed) but
+                # the process itself may still be finishing up on disk
+                # (e.g. flushing writes to a slower external drive). Let
+                # the user know we're still working instead of leaving the
+                # UI looking frozen at "99%". The I/O poller keeps running
+                # through this, so the progress bar keeps moving too as
+                # long as bytes are still being written.
+                self.file_update.emit(
+                    "Finishing up — waiting for the copy process to complete..."
+                )
+
                 self.proc.wait()
+
+            self._stop_io_poller()
+
+            # ----------------------------------------------------------- #
+            # Process has actually terminated here.
+            # Do NOT consider 100% complete before this point.
+            # ----------------------------------------------------------- #
 
             if self.cancelled:
                 self.status = "Cancelled"
-                self.elapsed_seconds = time.monotonic() - started_at
+                self.elapsed_seconds = (
+                    time.monotonic() - started_at
+                )
+
+                self._update_stats(
+                    speed=0,
+                    force=True,
+                )
+
                 self.finished_ok.emit(True)
                 return
 
@@ -510,39 +625,268 @@ class CopyWorker(QThread):
                 # success with differences.
                 if returncode >= 8:
                     self.status = "Error"
-                    self.elapsed_seconds = time.monotonic() - started_at
-                    self.error.emit(f"Robocopy exited with error code {returncode}.")
+
+                    self.elapsed_seconds = (
+                        time.monotonic() - started_at
+                    )
+
+                    self._update_stats(
+                        speed=0,
+                        force=True,
+                    )
+
+                    self.error.emit(
+                        f"Robocopy exited with error code "
+                        f"{returncode}."
+                    )
+
                     return
 
             else:
                 if returncode != 0:
                     self.status = "Error"
-                    self.elapsed_seconds = time.monotonic() - started_at
-                    self.error.emit(f"rsync exited with error code {returncode}.")
+
+                    self.elapsed_seconds = (
+                        time.monotonic() - started_at
+                    )
+
+                    self._update_stats(
+                        speed=0,
+                        force=True,
+                    )
+
+                    self.error.emit(
+                        f"rsync exited with error code "
+                        f"{returncode}."
+                    )
+
                     return
 
+            # Linux move cleanup happens only after rsync succeeds.
             if self.move and IS_LINUX:
+                self.file_update.emit("Cleaning up empty source folders...")
+
                 self._cleanup_empty_source_dirs()
 
+            # ----------------------------------------------------------- #
+            # ONLY NOW is the operation actually complete.
+            # ----------------------------------------------------------- #
+
             self.transferred_size = self.total_size
-            self.elapsed_seconds = time.monotonic() - started_at
+
+            self.elapsed_seconds = (
+                time.monotonic() - started_at
+            )
+
             self.status = "Success"
 
-            self.progress.emit(100)
+            self._emit_progress(100)
+
+            self._update_stats(
+                speed=0,
+                force=True,
+            )
 
             self.file_update.emit("Completed.")
-
-            self.speed_update.emit("")
 
             self.finished_ok.emit(False)
 
         except Exception as e:
+            self._stop_io_poller()
+
             self.status = "Error"
-            self.elapsed_seconds = time.monotonic() - started_at
+
+            self.elapsed_seconds = (
+                time.monotonic() - started_at
+            )
+
+            self._update_stats(
+                speed=0,
+                force=True,
+            )
+
             self.error.emit(str(e))
 
+    def _update_stats(self, speed=None, force=False):
+        """
+        Update transfer speed, transferred size and total size.
+
+        Speed is calculated from the amount transferred between
+        updates instead of average bytes / total elapsed time.
+        """
+
+        now = time.monotonic()
+
+        if speed is None:
+            elapsed = now - self.last_speed_time
+
+            if elapsed >= 0.25:
+                byte_delta = (
+                    self.transferred_size
+                    - self.last_speed_bytes
+                )
+
+                self.current_speed = (
+                    max(0, byte_delta) / elapsed
+                )
+
+                self.last_speed_bytes = (
+                    self.transferred_size
+                )
+
+                self.last_speed_time = now
+
+        else:
+            self.current_speed = max(0, speed)
+
+            if force:
+                self.last_speed_bytes = (
+                    self.transferred_size
+                )
+
+                self.last_speed_time = now
+
+        self.stats_update.emit(
+            format_size(self.current_speed) + "/s",
+            format_size(self.transferred_size),
+            format_size(self.total_size),
+        )
+
+    def _emit_progress(self, percentage):
+        """
+        Emit progress.
+
+        100% is reserved for the moment after the external
+        copy process has actually terminated successfully.
+        """
+
+        percentage = max(
+            0,
+            min(
+                100,
+                int(percentage),
+            ),
+        )
+
+        # Never allow the transfer parser to report 100%.
+        # 100% is emitted manually after proc.wait().
+        if self.status == "Running":
+            percentage = min(percentage, 99)
+
+        if percentage < self.last_progress:
+            return
+
+        self.last_progress = percentage
+
+        self.progress.emit(percentage)
+
+    def _update_progress_from_bytes(self, transferred_bytes):
+        """
+        Update progress using transferred bytes against
+        the pre-scanned total size.
+        """
+
+        if self.total_size <= 0:
+            return
+
+        transferred_bytes = max(
+            0,
+            min(
+                self.total_size,
+                int(transferred_bytes),
+            ),
+        )
+
+        if transferred_bytes < self.transferred_size:
+            return
+
+        self.transferred_size = transferred_bytes
+
+        self._update_stats()
+
+        percentage = (
+            self.transferred_size
+            / self.total_size
+            * 100
+        )
+
+        self._emit_progress(percentage)
+
+    # ---- I/O-counter polling (source of truth for progress) ----------- #
+    def _start_io_poller(self):
+        """
+        Start a background thread that periodically reads how many
+        bytes the copy process (and any children it forked, e.g.
+        rsync's sender/receiver) have actually written to the storage
+        layer, according to the kernel. This drives the progress bar
+        instead of parsing rsync/robocopy's own stdout, and instead of
+        re-scanning the destination directory (too expensive for large
+        trees).
+
+        Requires psutil. If it isn't installed, progress falls back to
+        just the filenames streaming by, plus the final jump to 100%
+        when the process exits — no live percentage in between.
+        """
+
+        if not self.io_tracking_available:
+            return
+
+        baseline = get_process_write_bytes(self.proc.pid)
+
+        self.write_bytes_baseline = baseline if baseline is not None else 0
+
+        self._stop_poll.clear()
+
+        self._io_poll_thread = threading.Thread(
+            target=self._io_poll_loop,
+            daemon=True,
+        )
+
+        self._io_poll_thread.start()
+
+    def _stop_io_poller(self):
+        self._stop_poll.set()
+
+        if self._io_poll_thread is not None:
+            self._io_poll_thread.join(timeout=2)
+            self._io_poll_thread = None
+
+    def _io_poll_loop(self):
+        poll_interval = 0.5
+
+        while not self._stop_poll.is_set():
+            self._poll_io_once()
+
+            if self._stop_poll.wait(poll_interval):
+                break
+
+        # One last read in case the process finished in between the
+        # previous tick and the stop signal.
+        self._poll_io_once()
+
+    def _poll_io_once(self):
+        written_total = get_process_write_bytes(self.proc.pid)
+
+        if written_total is None:
+            # The process (and its children) may have already exited
+            # and been reaped between polls — nothing to read anymore.
+            # transferred_size simply stops advancing here; it gets
+            # snapped to total_size once the operation is confirmed
+            # complete.
+            return
+
+        written = max(0, written_total - self.write_bytes_baseline)
+
+        self._update_progress_from_bytes(written)
+
+    # ---- Output readers (filenames only — see poller above for progress) #
     def _run_rsync(self):
-        """Read rsync's overall progress directly from its output."""
+        """
+        Read rsync's output for the name of each file as it's
+        transferred (via --info=name1). Progress itself comes from
+        _io_poll_loop, not from anything parsed here.
+        """
+
         for raw_line in self.proc.stdout:
             if self.cancelled:
                 break
@@ -552,61 +896,13 @@ class CopyWorker(QThread):
             if not line:
                 continue
 
-            progress_match = re.search(
-                r"(\d+(?:\.\d+)?)\s+([KMGTPE]?B)?\s+"
-                r"(\d+(?:\.\d+)?)%\s+"
-                r"(\d+(?:\.\d+)?\s*[KMGTPE]?B/s)",
-                line,
-            )
-
-            if progress_match:
-                percentage = float(progress_match.group(3))
-
-                self.progress.emit(
-                    max(
-                        0,
-                        min(
-                            100,
-                            int(percentage),
-                        ),
-                    )
-                )
-
-                speed = progress_match.group(4)
-
-                self.speed_update.emit(speed)
-
-                continue
-
-            # rsync --info=progress2 can also emit a line without
-            # a speed value depending on terminal/output conditions.
-            simple_progress = re.search(
-                r"(\d+(?:\.\d+)?)%",
-                line,
-            )
-
-            if simple_progress:
-                percentage = float(simple_progress.group(1))
-
-                self.progress.emit(
-                    max(
-                        0,
-                        min(
-                            100,
-                            int(percentage),
-                        ),
-                    )
-                )
-
-            if not line.startswith("sent ") and not line.startswith("total size"):
-                self.file_update.emit(line[:160])
+            self.file_update.emit(line[:160])
 
     def _run_robocopy(self):
         """
-        Read robocopy output directly.
-
-        Robocopy does not expose a reliable overall byte percentage
-        like rsync, so the progress bar is based on completed files.
+        Read robocopy's output for the name of each file as it's
+        transferred. Progress itself comes from _io_poll_loop, not
+        from robocopy's own per-file percentages.
         """
         for raw_line in self.proc.stdout:
             if self.cancelled:
@@ -619,10 +915,12 @@ class CopyWorker(QThread):
 
             lower = line.lower()
 
-            # Normalize excessive whitespace in Robocopy output.
-            display_line = re.sub(r"\s+", " ", line).strip()
+            display_line = re.sub(
+                r"\s+",
+                " ",
+                line,
+            ).strip()
 
-            # Skip robocopy headers and summary information.
             if lower.startswith(
                 (
                     "-------------------------------------------------------------------------------",
@@ -637,8 +935,18 @@ class CopyWorker(QThread):
             ):
                 continue
 
-            # Robocopy normally reports copied files with:
-            # New File / Newer / Older / Extra File / etc.
+            file_progress = re.search(
+                r"^\s*(\d+(?:\.\d+)?)%\s+" r"(.+?)\s+" r"(\d+)\s+" r"(.+)$",
+                line,
+            )
+
+            if file_progress:
+                filename = file_progress.group(4).strip()
+
+                self.file_update.emit(filename[:160])
+
+                continue
+
             if (
                 "new file" in lower
                 or "newer" in lower
@@ -646,35 +954,21 @@ class CopyWorker(QThread):
                 or "extra file" in lower
                 or "modified" in lower
             ):
-                self.completed_files += 1
-
-                if self.total_files:
-                    percentage = int(self.completed_files / self.total_files * 100)
-
-                    self.progress.emit(
-                        min(
-                            99,
-                            max(
-                                0,
-                                percentage,
-                            ),
-                        )
-                    )
-
                 self.file_update.emit(display_line[:160])
+
                 continue
 
-            # Show individual file paths that robocopy outputs.
             if "\\" in line:
                 self.file_update.emit(display_line[:160])
 
     def _count_files(self, path):
-        """Count source files once for Windows progress reporting."""
+        """Count source files once during the pre-scan."""
         count = 0
 
         try:
             for root, _dirs, files in os.walk(path):
                 count += len(files)
+
         except OSError:
             return 0
 
@@ -907,13 +1201,11 @@ class MainWindow(QWidget):
 
         self.setWindowTitle("Fast Copy Tool")
 
-        self.setWindowIcon(
-            QIcon(resource_path("assets/icon.png"))
-        )
+        self.setWindowIcon(QIcon(resource_path("assets/icon.png")))
 
         self.setFixedSize(
             600,
-            200,
+            220,
         )
 
         self.worker = None
@@ -998,6 +1290,7 @@ class MainWindow(QWidget):
 
         root.addWidget(self.progress)
 
+        # Current file being copied/moved.
         self.file_label = QLabel("Ready.")
 
         self.file_label.setObjectName("fileLabel")
@@ -1009,6 +1302,14 @@ class MainWindow(QWidget):
         self.file_label.linkActivated.connect(self._show_details)
 
         root.addWidget(self.file_label)
+
+        # Transferred size / total size + speed, e.g.:
+        # "512.0 MB of 4.20 GB (speed: 85.3 MB/s)"
+        self.stats_label = QLabel("0 B of 0 B (speed: 0 B/s)")
+
+        self.stats_label.setObjectName("fileLabel")
+
+        root.addWidget(self.stats_label)
 
         root.addStretch(1)
 
@@ -1095,6 +1396,7 @@ class MainWindow(QWidget):
                 "Missing Information",
                 "Please select a source and destination directory.",
             )
+
             return
 
         if not os.path.isdir(src):
@@ -1103,6 +1405,7 @@ class MainWindow(QWidget):
                 "Error",
                 "The source directory does not exist.",
             )
+
             return
 
         if os.path.abspath(src) == os.path.abspath(dst):
@@ -1111,9 +1414,13 @@ class MainWindow(QWidget):
                 "Error",
                 "The source and destination directories cannot be the same.",
             )
+
             return
 
-        os.makedirs(dst, exist_ok=True)
+        os.makedirs(
+            dst,
+            exist_ok=True,
+        )
 
         tool = CopyTool()
 
@@ -1124,20 +1431,32 @@ class MainWindow(QWidget):
                 f"'{tool.name}' is not installed.\n"
                 "Please open [About] and install it first.",
             )
+
             return
 
         self.current_operation = "Move" if move else "Copy"
 
         self.progress.setValue(0)
+
+        self.stats_label.setText("0 B of 0 B (speed: 0 B/s)")
+
         self.file_label.setText("Preparing...")
 
         self.btn_copy.setEnabled(False)
+
         self.btn_move.setEnabled(False)
+
         self.btn_pause.setEnabled(True)
+
         self.btn_pause.setText("Pause")
+
         self.btn_cancel.setEnabled(True)
 
-        self.worker = CopyWorker(src, dst, move)
+        self.worker = CopyWorker(
+            src,
+            dst,
+            move,
+        )
 
         self.worker.progress.connect(self.progress.setValue)
 
@@ -1145,17 +1464,23 @@ class MainWindow(QWidget):
             lambda name: self.file_label.setText(name[:150])
         )
 
-        self.worker.speed_update.connect(self._on_speed_update)
+        self.worker.stats_update.connect(self._on_stats_update)
+
         self.worker.finished_ok.connect(self._on_done)
+
         self.worker.error.connect(self._on_error)
 
         self.worker.start()
 
-    def _on_speed_update(self, speed):
-        if speed:
-            self.file_label.setText(
-                f"Transfer speed: {speed}"
-            )
+    def _on_stats_update(
+        self,
+        speed,
+        transferred,
+        total,
+    ):
+        self.stats_label.setText(
+            f"{transferred} of {total} (speed: {speed})"
+        )
 
     def _on_done(self, cancelled):
         operation = self.current_operation or "Operation"
@@ -1164,18 +1489,28 @@ class MainWindow(QWidget):
 
         if cancelled:
             self.file_label.setText("Cancelled.")
+
             return
+
+        # Make absolutely sure the UI ends in:
+        # total of total (speed: 0 B/s)
+        if self.worker:
+            total_text = format_size(self.worker.total_size)
+
+            self.stats_label.setText(
+                f"{total_text} of {total_text} (speed: 0 B/s)"
+            )
 
         details = self._details_text("Success")
 
         self.file_label.setText(
-            'Completed&nbsp;&nbsp;<a href="details">[Detail]</a>'
+            "Completed&nbsp;&nbsp;" '<a href="details">[Detail]</a>'
         )
 
         QMessageBox.information(
             self,
             f"{operation} completed",
-            f"{operation} operation completed successfully.\n\n{details}",
+            f"{operation} operation completed successfully.\n\n" f"{details}",
         )
 
     def _on_error(self, message):
@@ -1185,9 +1520,7 @@ class MainWindow(QWidget):
 
         details = self._details_text("Error")
 
-        self.file_label.setText(
-            'Failed&nbsp;&nbsp;<a href="details">[Detail]</a>'
-        )
+        self.file_label.setText("Failed&nbsp;&nbsp;" '<a href="details">[Detail]</a>')
 
         QMessageBox.critical(
             self,
@@ -1202,12 +1535,14 @@ class MainWindow(QWidget):
         return (
             f"Status: {status}\n"
             f"Files: {self.worker.total_files}\n"
-            f"Size: {format_size(self.worker.transferred_size)}\n"
+            f"Size: {format_size(self.worker.transferred_size)} / "
+            f"{format_size(self.worker.total_size)}\n"
             f"Time: {format_duration(self.worker.elapsed_seconds)}"
         )
 
     def _show_details(self, _link):
         operation = self.current_operation or "Operation"
+
         status = self.worker.status if self.worker else "Unknown"
 
         QMessageBox.information(
@@ -1218,9 +1553,11 @@ class MainWindow(QWidget):
 
     def _reset_buttons(self):
         self.btn_copy.setEnabled(True)
+
         self.btn_move.setEnabled(True)
 
         self.btn_pause.setEnabled(False)
+
         self.btn_pause.setText("Pause")
 
         self.btn_cancel.setEnabled(False)
@@ -1257,6 +1594,7 @@ class MainWindow(QWidget):
     # ---- About ----------------------------------------------------------- #
     def show_about(self):
         dialog = AboutDialog(self)
+
         dialog.exec()
 
 
@@ -1340,19 +1678,31 @@ class AboutDialog(QDialog):
         lines = [
             f"Operating System: {os_name}",
             f"Copy Tool: {self.tool.name}",
-            f"Status: {'Installed' if installed else 'NOT INSTALLED'}",
+            f"Status: " f"{'Installed' if installed else 'NOT INSTALLED'}",
         ]
 
         if IS_LINUX:
             lines.append(f"Package Manager: " f"{package_manager or 'Not detected'}")
 
         if installed:
-            lines.append(f"Version: {version or 'Unknown'}")
+            lines.append(f"Version: " f"{version or 'Unknown'}")
+
         else:
             lines.append(
                 f"'{self.tool.name}' is not available "
                 "on this system. Click [Install] to install it."
             )
+
+        lines.append(
+            "Live Progress: "
+            + (
+                "Enabled (via psutil)"
+                if HAS_PSUTIL
+                else "Disabled — install psutil for a live progress "
+                "bar (pip install psutil). Without it, progress "
+                "only jumps to 100% once the operation finishes."
+            )
+        )
 
         self.info_label.setText("\n".join(lines))
 
@@ -1362,6 +1712,7 @@ class AboutDialog(QDialog):
 
     def _run_bg(self, func, title):
         self.btn_install.setEnabled(False)
+
         self.btn_update.setEnabled(False)
 
         self.info_label.setText("Processing, please wait...")
@@ -1375,6 +1726,7 @@ class AboutDialog(QDialog):
                     title,
                     message,
                 )
+
             else:
                 QMessageBox.critical(
                     self,
